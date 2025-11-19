@@ -174,6 +174,19 @@ class AlpacaBroker:
         )
         self.min_notional = ALPACA_MIN_ORDER_NOTIONAL
 
+    def is_market_open(self) -> bool:
+        """
+        Returns True if the US stock market is currently open
+        according to Alpaca's market clock.
+        """
+        try:
+            clock = self.api.get_clock()
+            return bool(getattr(clock, "is_open", False))
+        except Exception as e:
+            print(f"Alpaca: failed to fetch market clock: {e}")
+            # Be conservative: if we can't tell, don't trade.
+            return False
+
     def get_available_funds(self) -> float:
         account = self.api.get_account()
         # You could also use account.cash; buying_power includes leverage if enabled
@@ -376,6 +389,12 @@ def process_signal(signal: TradeSignal, alpaca: AlpacaBroker, kraken: KrakenBrok
         symbol_for_venue = signal.symbol
 
     print(f"Row {signal.row_index}: {symbol_for_venue} | venue={venue} | signal={signal.signal_pct}")
+
+    # For Alpaca (stocks): only trade when the regular market is open
+    if not signal.is_crypto:
+        if not alpaca.is_market_open():
+            print("  Alpaca: market is closed, skipping stock order.")
+            return
 
     # Check for duplicate unfilled orders first
     if signal.is_crypto:
