@@ -1,0 +1,4 @@
+alpaca-trade-api
+gspread
+google-auth
+requests
