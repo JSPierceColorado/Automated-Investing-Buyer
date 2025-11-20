@@ -371,8 +371,12 @@ class KrakenBroker:
         self._last_nonce = 0
 
     def _next_nonce(self) -> int:
-        """Generate a strictly increasing nonce, even if time goes backwards slightly."""
-        now = int(time.time() * 1000)
+        """
+        Generate a strictly increasing nonce based on a *very* large
+        time-based value (nanoseconds since epoch), so it's bigger
+        than any previous ms/µs-based nonce Kraken has seen.
+        """
+        now = int(time.time() * 1_000_000_000)  # ns since epoch
         if now <= self._last_nonce:
             now = self._last_nonce + 1
         self._last_nonce = now
