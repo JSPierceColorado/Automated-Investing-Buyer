@@ -80,47 +80,74 @@ def get_gspread_client() -> gspread.Client:
 
 
 def read_signals_from_sheet() -> List[TradeSignal]:
+    print("=== [DEBUG] Reading signals from Google Sheet ===")
     client = get_gspread_client()
     sheet = client.open(SPREADSHEET_NAME).worksheet(WORKSHEET_NAME)
     all_values = sheet.get_all_values()
 
     if not all_values or len(all_values) < 2:
+        print("[DEBUG] Sheet is empty or has no data rows.")
         return []
 
     header = all_values[0]
     data_rows = all_values[1:]
+    print(f"[DEBUG] Header row: {header}")
+    print(f"[DEBUG] Number of data rows: {len(data_rows)}")
 
     signals: List[TradeSignal] = []
 
     for idx, row in enumerate(data_rows, start=2):  # row 2 in sheet is first data row
         # Be defensive about row length
         if len(row) <= max(COL_SYMBOL, COL_IS_CRYPTO, COL_SIGNAL, COL_ICON):
+            print(f"[DEBUG] Row {idx} skipped: too short (len={len(row)}). Raw row: {row}")
             continue
 
         icon = (row[COL_ICON] or "").strip()
-        if "🟢" not in icon:
-            continue
-
-        symbol = (row[COL_SYMBOL] or "").strip().upper()
-        if not symbol:
-            continue
-
-        is_crypto_str = (row[COL_IS_CRYPTO] or "").strip().upper()
-        is_crypto = is_crypto_str == "TRUE"
-
+        symbol_raw = (row[COL_SYMBOL] or "").strip()
+        is_crypto_str = (row[COL_IS_CRYPTO] or "").strip()
         signal_str = (row[COL_SIGNAL] or "").strip()
+
+        print(
+            f"[DEBUG] Row {idx} raw -> icon='{icon}', symbol='{symbol_raw}', "
+            f"is_crypto_col='{is_crypto_str}', signal='{signal_str}'"
+        )
+
+        if "🟢" not in icon:
+            print(f"[DEBUG] Row {idx} skipped: no 🟢 icon.")
+            continue
+
+        symbol = symbol_raw.upper()
+        if not symbol:
+            print(f"[DEBUG] Row {idx} skipped: empty symbol.")
+            continue
+
+        is_crypto = is_crypto_str.strip().upper() == "TRUE"
+
         if not signal_str:
+            print(f"[DEBUG] Row {idx} skipped: empty signal cell.")
             continue
 
         try:
             signal_pct = float(signal_str)
         except ValueError:
-            print(f"Row {idx}: invalid signal value '{signal_str}', skipping.")
+            print(f"[DEBUG] Row {idx} skipped: invalid signal value '{signal_str}'.")
             continue
 
-        signals.append(TradeSignal(symbol=symbol, is_crypto=is_crypto,
-                                   signal_pct=signal_pct, row_index=idx))
+        print(
+            f"[DEBUG] Row {idx} accepted as signal: "
+            f"symbol={symbol}, is_crypto={is_crypto}, signal_pct={signal_pct}"
+        )
 
+        signals.append(
+            TradeSignal(
+                symbol=symbol,
+                is_crypto=is_crypto,
+                signal_pct=signal_pct,
+                row_index=idx,
+            )
+        )
+
+    print(f"[DEBUG] Total signals loaded: {len(signals)}")
     return signals
 
 
@@ -136,7 +163,13 @@ def compute_order_notional(available_funds: float, signal_pct: float) -> float:
         closer to -100 -> larger orders
     - We keep a floor multiplier so weak signals don't shrink into dust.
     """
+    print(
+        f"[DEBUG] compute_order_notional: available_funds={available_funds:.2f}, "
+        f"signal_pct={signal_pct}"
+    )
+
     if available_funds <= 0:
+        print("[DEBUG] available_funds <= 0, returning 0.0")
         return 0.0
 
     base_value = available_funds * BASE_ORDER_FRACTION
@@ -150,8 +183,18 @@ def compute_order_notional(available_funds: float, signal_pct: float) -> float:
 
     notional = base_value * multiplier
 
+    print(
+        f"[DEBUG] compute_order_notional: base_value={base_value:.2f}, "
+        f"clamped={clamped}, strength={strength:.3f}, "
+        f"multiplier={multiplier:.3f}, notional={notional:.2f}"
+    )
+
     # Keep from constantly producing silly tiny sizes
     if notional < MIN_ORDER_DOLLARS:
+        print(
+            f"[DEBUG] notional {notional:.2f} < MIN_ORDER_DOLLARS {MIN_ORDER_DOLLARS:.2f}, "
+            "returning 0.0"
+        )
         return 0.0
 
     return notional
@@ -180,44 +223,61 @@ class AlpacaBroker:
         according to Alpaca's market clock.
         """
         try:
+            print("[DEBUG] Alpaca.is_market_open: fetching market clock")
             clock = self.api.get_clock()
-            return bool(getattr(clock, "is_open", False))
+            is_open = bool(getattr(clock, "is_open", False))
+            print(f"[DEBUG] Alpaca.is_market_open: is_open={is_open}")
+            return is_open
         except Exception as e:
             print(f"Alpaca: failed to fetch market clock: {e}")
             # Be conservative: if we can't tell, don't trade.
             return False
 
     def get_available_funds(self) -> float:
+        print("[DEBUG] Alpaca.get_available_funds: fetching account")
         account = self.api.get_account()
-        # You could also use account.cash; buying_power includes leverage if enabled
-        return float(account.cash)
+        funds = float(account.cash)
+        print(f"[DEBUG] Alpaca.get_available_funds: cash={funds}")
+        # You could also use account.buying_power; cash is simpler for now
+        return funds
 
     def has_position(self, symbol: str) -> bool:
         try:
+            print(f"[DEBUG] Alpaca.has_position: checking position for {symbol}")
             pos = self.api.get_position(symbol)
             qty = float(pos.qty)
-            return qty > 0
+            has_pos = qty > 0
+            print(f"[DEBUG] Alpaca.has_position: qty={qty}, has_position={has_pos}")
+            return has_pos
         except Exception as e:
             # Alpaca throws an error if no position exists
             if "position does not exist" in str(e).lower():
+                print(f"[DEBUG] Alpaca.has_position: no existing position for {symbol}")
                 return False
+            print(f"[DEBUG] Alpaca.has_position: unexpected error: {e}")
             raise
 
     def has_open_buy_order(self, symbol: str) -> bool:
+        print(f"[DEBUG] Alpaca.has_open_buy_order: listing open orders for {symbol}")
         orders = self.api.list_orders(
             status="open",
             direction="desc",
             nested=False,
         )
         for o in orders:
+            print(f"[DEBUG] Alpaca.has_open_buy_order: found open order {o.id} {o.symbol} {o.side}")
             if o.symbol.upper() == symbol.upper() and o.side.lower() == "buy":
+                print(f"[DEBUG] Alpaca.has_open_buy_order: open BUY order exists for {symbol}")
                 return True
+        print(f"[DEBUG] Alpaca.has_open_buy_order: no open BUY order for {symbol}")
         return False
 
     def get_best_bid(self, symbol: str) -> Optional[float]:
         try:
+            print(f"[DEBUG] Alpaca.get_best_bid: fetching latest quote for {symbol}")
             quote = self.api.get_latest_quote(symbol)
             bid = float(quote.bp)
+            print(f"[DEBUG] Alpaca.get_best_bid: bid={bid}")
             if bid > 0:
                 return bid
         except Exception as e:
@@ -225,6 +285,7 @@ class AlpacaBroker:
         return None
 
     def place_order(self, symbol: str, notional: float) -> None:
+        print(f"[DEBUG] Alpaca.place_order: symbol={symbol}, notional={notional:.2f}")
         if notional < self.min_notional:
             print(f"Alpaca: notional ${notional:.2f} below Alpaca min ${self.min_notional:.2f}, skipping {symbol}")
             return
@@ -233,7 +294,12 @@ class AlpacaBroker:
 
         if best_bid is not None:
             qty = round(notional / best_bid, 3)  # fractional shares
-            if qty * best_bid < self.min_notional:
+            est_notional = qty * best_bid
+            print(
+                f"[DEBUG] Alpaca.place_order: best_bid={best_bid}, "
+                f"qty={qty}, est_notional={est_notional:.2f}"
+            )
+            if est_notional < self.min_notional:
                 print(f"Alpaca: qty rounding makes order below min notional, skipping {symbol}")
                 return
 
@@ -290,75 +356,99 @@ class KrakenBroker:
             "API-Sign": self._sign(url_path, data),
         }
         url = self.base_url + url_path
+        print(f"[DEBUG] Kraken._private: POST {url} with data={data}")
         resp = requests.post(url, headers=headers, data=data, timeout=10)
         resp.raise_for_status()
         result = resp.json()
         if result.get("error"):
+            print(f"[DEBUG] Kraken._private: error from {method}: {result['error']}")
             raise RuntimeError(f"Kraken error {method}: {result['error']}")
         return result["result"]
 
     def _public(self, method: str, params: Optional[dict] = None) -> dict:
         url = f"{self.base_url}/0/public/{method}"
+        print(f"[DEBUG] Kraken._public: GET {url} params={params or {}}")
         resp = requests.get(url, params=params or {}, timeout=10)
         resp.raise_for_status()
         result = resp.json()
         if result.get("error"):
+            print(f"[DEBUG] Kraken._public: error from {method}: {result['error']}")
             raise RuntimeError(f"Kraken public error {method}: {result['error']}")
         return result["result"]
 
     def symbol_to_pair(self, symbol: str) -> Optional[str]:
-        return KRAKEN_PAIR_MAP.get(symbol.upper())
+        pair = KRAKEN_PAIR_MAP.get(symbol.upper())
+        print(f"[DEBUG] Kraken.symbol_to_pair: symbol={symbol} -> pair={pair}")
+        return pair
 
     def get_available_funds(self) -> float:
         balances = self._private("Balance")
-        # Most accounts hold USD as ZUSD
+        print(f"[DEBUG] Kraken.get_available_funds: raw balances={balances}")
         usd = balances.get("ZUSD") or balances.get("USD")
         if usd is None:
+            print("[DEBUG] Kraken.get_available_funds: no ZUSD/USD balance found, returning 0.0")
             return 0.0
-        return float(usd)
+        funds = float(usd)
+        print(f"[DEBUG] Kraken.get_available_funds: using USD/ZUSD={funds}")
+        return funds
 
     def has_open_buy_order(self, pair: str) -> bool:
         open_orders = self._private("OpenOrders")
         open_dict = open_orders.get("open", {})
-        for _, order in open_dict.items():
+        print(f"[DEBUG] Kraken.has_open_buy_order: checking pair={pair}, open_order_keys={list(open_dict.keys())}")
+        for oid, order in open_dict.items():
             desc = order.get("descr", {})
             if desc.get("pair") == pair and desc.get("type") == "buy":
+                print(f"[DEBUG] Kraken.has_open_buy_order: found open BUY {oid} for pair={pair}")
                 return True
+        print(f"[DEBUG] Kraken.has_open_buy_order: no open BUY for pair={pair}")
         return False
 
     def get_best_bid(self, pair: str) -> Optional[float]:
+        print(f"[DEBUG] Kraken.get_best_bid: requesting ticker for pair={pair}")
         ticker = self._public("Ticker", {"pair": pair})
-        # ticker result key may be the canonical pair name
         k = next(iter(ticker.keys()))
         bid_str = ticker[k]["b"][0]  # 'b' = [best bid, whole lot volume, lot volume]
         try:
             bid = float(bid_str)
+            print(f"[DEBUG] Kraken.get_best_bid: pair={pair}, bid={bid}")
             if bid > 0:
                 return bid
         except ValueError:
-            pass
+            print(f"[DEBUG] Kraken.get_best_bid: invalid bid_str='{bid_str}'")
         return None
 
     def place_order(self, symbol: str, notional: float) -> None:
+        print(f"[DEBUG] Kraken.place_order: symbol={symbol}, notional={notional:.2f}")
         pair = self.symbol_to_pair(symbol)
         if not pair:
-            print(f"Kraken: no pair mapping for symbol {symbol}, skipping.")
+            print(f"[DEBUG] Kraken.place_order: no pair mapping for symbol {symbol}, skipping.")
             return
 
         if notional < self.min_notional:
-            print(f"Kraken: notional ${notional:.2f} below Kraken min ${self.min_notional:.2f}, skipping {symbol}")
+            print(
+                f"[DEBUG] Kraken.place_order: notional ${notional:.2f} below Kraken min "
+                f"${self.min_notional:.2f}, skipping {symbol}"
+            )
             return
 
         best_bid = self.get_best_bid(pair)
         if best_bid is None:
-            print(f"Kraken: could not fetch best bid for {pair}, skipping order for {symbol}")
+            print(f"[DEBUG] Kraken.place_order: could not fetch best bid for {pair}, skipping order for {symbol}")
             return
 
         volume = notional / best_bid
         volume = round(volume, 8)  # crypto precision
+        print(
+            f"[DEBUG] Kraken.place_order: best_bid={best_bid}, "
+            f"raw_volume={notional / best_bid}, rounded_volume={volume}"
+        )
 
         if volume * best_bid < self.min_notional:
-            print(f"Kraken: volume rounding makes order below min notional, skipping {symbol}")
+            print(
+                f"[DEBUG] Kraken.place_order: volume rounding makes order below min notional "
+                f"({volume * best_bid:.2f} < {self.min_notional:.2f}), skipping {symbol}"
+            )
             return
 
         data = {
@@ -370,7 +460,7 @@ class KrakenBroker:
             # "timeinforce": "GTC",  # Kraken uses GTC/IOC/GTD. No pure "day" TIF.
         }
 
-        print(f"Kraken: placing LIMIT buy {symbol} ({pair}), vol={volume}, limit={best_bid}")
+        print(f"[DEBUG] Kraken.place_order: submitting LIMIT buy {symbol} ({pair}), vol={volume}, limit={best_bid}")
         self._private("AddOrder", data=data)
 
 
@@ -388,42 +478,48 @@ def process_signal(signal: TradeSignal, alpaca: AlpacaBroker, kraken: KrakenBrok
         broker = alpaca
         symbol_for_venue = signal.symbol
 
-    print(f"Row {signal.row_index}: {symbol_for_venue} | venue={venue} | signal={signal.signal_pct}")
+    print(
+        f"=== [DEBUG] Processing row {signal.row_index}: symbol={symbol_for_venue}, "
+        f"venue={venue}, signal={signal.signal_pct} ==="
+    )
 
     # For Alpaca (stocks): only trade when the regular market is open
     if not signal.is_crypto:
+        print("[DEBUG] process_signal: non-crypto, checking Alpaca market status...")
         if not alpaca.is_market_open():
-            print("  Alpaca: market is closed, skipping stock order.")
+            print("[DEBUG] Alpaca: market is closed, skipping stock order.")
             return
 
     # Check for duplicate unfilled orders first
     if signal.is_crypto:
+        print("[DEBUG] process_signal: crypto path, checking Kraken open orders...")
         pair = kraken.symbol_to_pair(symbol_for_venue)
         if not pair:
-            print(f"  No Kraken pair mapping for {symbol_for_venue}, skipping.")
+            print(f"[DEBUG] No Kraken pair mapping for {symbol_for_venue}, skipping.")
             return
         if kraken.has_open_buy_order(pair):
-            print(f"  Kraken: open BUY order already exists for {pair}, skipping.")
+            print(f"[DEBUG] Kraken: open BUY order already exists for {pair}, skipping.")
             return
     else:
+        print("[DEBUG] process_signal: stock path, checking Alpaca open orders and positions...")
         if alpaca.has_open_buy_order(symbol_for_venue):
-            print(f"  Alpaca: open BUY order already exists for {symbol_for_venue}, skipping.")
+            print(f"[DEBUG] Alpaca: open BUY order already exists for {symbol_for_venue}, skipping.")
             return
         # Also check positions so we don't double up the asset
         if alpaca.has_position(symbol_for_venue):
-            print(f"  Alpaca: position already exists for {symbol_for_venue}, skipping.")
+            print(f"[DEBUG] Alpaca: position already exists for {symbol_for_venue}, skipping.")
             return
 
     # Determine available funds on the selected venue
     available_funds = broker.get_available_funds()
-    print(f"  {venue} available funds: ${available_funds:.2f}")
+    print(f"[DEBUG] process_signal: {venue} available funds: ${available_funds:.2f}")
 
     notional = compute_order_notional(available_funds, signal.signal_pct)
     if notional <= 0:
-        print(f"  Computed notional is ${notional:.2f}, skipping (too small / zero).")
+        print(f"[DEBUG] process_signal: computed notional is ${notional:.2f}, skipping (too small / zero).")
         return
 
-    print(f"  Computed notional for {symbol_for_venue}: ${notional:.2f}")
+    print(f"[DEBUG] process_signal: final notional for {symbol_for_venue}: ${notional:.2f}")
 
     # Final venue-specific min-check and order placement
     broker.place_order(symbol_for_venue, notional)
@@ -436,7 +532,7 @@ def main():
         print("No signals found with 🟢 icon. Exiting.")
         return
 
-    print(f"Found {len(signals)} signals with 🟢")
+    print(f"[DEBUG] main: Found {len(signals)} signals with 🟢")
 
     alpaca = AlpacaBroker()
     kraken = KrakenBroker()
@@ -445,7 +541,7 @@ def main():
         try:
             process_signal(signal, alpaca, kraken)
         except Exception as e:
-            print(f"Error processing row {signal.row_index} ({signal.symbol}): {e}")
+            print(f"[DEBUG] Error processing row {signal.row_index} ({signal.symbol}): {e}")
 
     print("=== Automated Buyer Bot run complete ===")
 
