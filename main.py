@@ -367,6 +367,17 @@ class KrakenBroker:
         self.api_secret = KRAKEN_API_SECRET
         self.min_notional = KRAKEN_MIN_ORDER_NOTIONAL
 
+        # Track last nonce we used (per process) to ensure monotonicity
+        self._last_nonce = 0
+
+    def _next_nonce(self) -> int:
+        """Generate a strictly increasing nonce, even if time goes backwards slightly."""
+        now = int(time.time() * 1000)
+        if now <= self._last_nonce:
+            now = self._last_nonce + 1
+        self._last_nonce = now
+        return now
+
     def _sign(self, url_path: str, data: dict) -> str:
         # Based on Kraken’s official Python example
         postdata = urllib.parse.urlencode(data)
@@ -379,14 +390,14 @@ class KrakenBroker:
     def _private(self, method: str, data: Optional[dict] = None) -> dict:
         if data is None:
             data = {}
-        data["nonce"] = int(time.time() * 1000)
+        data["nonce"] = self._next_nonce()
         url_path = f"/0/private/{method}"
         headers = {
             "API-Key": self.api_key,
             "API-Sign": self._sign(url_path, data),
         }
         url = self.base_url + url_path
-        vlog(f"[DEBUG] Kraken._private: POST {url} method={method}")
+        vlog(f"[DEBUG] Kraken._private: POST {url} method={method}, nonce={data['nonce']}")
         resp = requests.post(url, headers=headers, data=data, timeout=10)
         resp.raise_for_status()
         result = resp.json()
