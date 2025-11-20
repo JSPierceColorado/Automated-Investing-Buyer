@@ -370,6 +370,9 @@ class KrakenBroker:
         # Track last nonce we used (per process) to ensure monotonicity
         self._last_nonce = 0
 
+        # Cache for pair -> base asset lookups            # <<< NEW
+        self._pair_base_cache: dict[str, str] = {}        # <<< NEW
+
     def _next_nonce(self) -> int:
         """
         Generate a strictly increasing nonce based on a *very* large
@@ -430,6 +433,68 @@ class KrakenBroker:
             pair = s.replace("-", "").replace("/", "")
         dlog(f"[DEBUG] Kraken.symbol_to_pair: symbol={symbol} -> pair={pair}")
         return pair
+
+    # === NEW: base-asset and position helpers =======================
+
+    def _get_base_asset_for_pair(self, pair: str) -> Optional[str]:  # <<< NEW
+        """
+        Look up the base asset for a given trading pair using AssetPairs.
+        Uses a small cache to avoid repeated API calls for the same pair.
+        """
+        if pair in self._pair_base_cache:
+            return self._pair_base_cache[pair]
+
+        try:
+            info = self._public("AssetPairs", {"pair": pair})
+            if not info:
+                dlog(f"[DEBUG] Kraken._get_base_asset_for_pair: empty info for pair={pair}")
+                return None
+
+            k = next(iter(info.keys()))
+            base_asset = info[k].get("base")
+            dlog(f"[DEBUG] Kraken._get_base_asset_for_pair: pair={pair}, base={base_asset}")
+            if base_asset:
+                self._pair_base_cache[pair] = base_asset
+                return base_asset
+        except Exception as e:
+            dlog(f"[DEBUG] Kraken._get_base_asset_for_pair: error for pair={pair}: {e}")
+        return None
+
+    def has_position(self, pair: str) -> bool:  # <<< NEW
+        """
+        Returns True if we currently hold any of the base asset for this pair.
+        For example, for pair XBTUSD it checks whether our XXBT balance > 0.
+        """
+        base_asset = self._get_base_asset_for_pair(pair)
+        if not base_asset:
+            dlog(f"[DEBUG] Kraken.has_position: could not determine base asset for {pair}.")
+            return False
+
+        try:
+            balances = self._private("Balance")
+            vlog(f"[DEBUG] Kraken.has_position: balances={balances}")
+            bal_str = balances.get(base_asset)
+            if not bal_str:
+                dlog(
+                    f"[DEBUG] Kraken.has_position: no balance entry for base_asset={base_asset}, "
+                    f"treating as no position."
+                )
+                return False
+
+            amount = float(bal_str)
+            has_pos = amount > 0
+            dlog(
+                f"[DEBUG] Kraken.has_position: base_asset={base_asset}, "
+                f"amount={amount}, has_position={has_pos}"
+            )
+            return has_pos
+        except Exception as e:
+            dlog(f"[DEBUG] Kraken.has_position: error checking position for pair={pair}: {e}")
+            # On error, be permissive so we don't deadlock trading completely.
+            # If you prefer to block on error, return True instead.
+            return False
+
+    # ===============================================================
 
     def get_available_funds(self) -> float:
         balances = self._private("Balance")
@@ -556,6 +621,13 @@ def process_signal(signal: TradeSignal, alpaca: AlpacaBroker, kraken: KrakenBrok
             return
         if kraken.has_open_buy_order(pair):
             dlog(f"[DEBUG] Kraken: open BUY order already exists for {pair}, skipping.")
+            return
+        # NEW: also skip if we already hold the base asset for this pair
+        if kraken.has_position(pair):  # <<< NEW
+            dlog(
+                f"[DEBUG] Kraken: position already exists for base asset of {pair}, "
+                f"skipping."
+            )
             return
     else:
         dlog("[DEBUG] process_signal: stock path, checking Alpaca open orders and positions...")
