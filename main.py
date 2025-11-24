@@ -27,12 +27,12 @@ COL_IS_CRYPTO = 3   # Column D (TRUE => Kraken, FALSE => Alpaca)
 COL_SIGNAL = 18     # Column S
 COL_ICON = 22       # Column W
 
-BASE_ORDER_FRACTION = float(os.getenv("BASE_ORDER_FRACTION", "0.15"))
+BASE_ORDER_FRACTION = float(os.getenv("BASE_ORDER_FRACTION", "0.05"))
 MIN_SIGNAL_MULTIPLIER = float(os.getenv("MIN_SIGNAL_MULTIPLIER", "0.25"))
 MIN_ORDER_DOLLARS = float(os.getenv("MIN_ORDER_DOLLARS", "1.0"))
 
-ALPACA_MIN_ORDER_NOTIONAL = float(os.getenv("ALPACA_MIN_ORDER_NOTIONAL", "2.0"))
-KRAKEN_MIN_ORDER_NOTIONAL = float(os.getenv("KRAKEN_MIN_ORDER_NOTIONAL", "10.0"))
+ALPACA_MIN_ORDER_NOTIONAL = float(os.getenv("ALPACA_MIN_ORDER_NOTIONAL", "1.0"))
+KRAKEN_MIN_ORDER_NOTIONAL = float(os.getenv("KRAKEN_MIN_ORDER_NOTIONAL", "5.0"))
 
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_API_SECRET = os.getenv("ALPACA_API_SECRET")
@@ -370,8 +370,8 @@ class KrakenBroker:
         # Track last nonce we used (per process) to ensure monotonicity
         self._last_nonce = 0
 
-        # Cache for pair -> base asset lookups            # <<< NEW
-        self._pair_base_cache: dict[str, str] = {}        # <<< NEW
+        # Cache for pair -> base asset lookups
+        self._pair_base_cache: dict[str, str] = {}
 
     def _next_nonce(self) -> int:
         """
@@ -434,9 +434,9 @@ class KrakenBroker:
         dlog(f"[DEBUG] Kraken.symbol_to_pair: symbol={symbol} -> pair={pair}")
         return pair
 
-    # === NEW: base-asset and position helpers =======================
+    # === base-asset and position helpers =======================
 
-    def _get_base_asset_for_pair(self, pair: str) -> Optional[str]:  # <<< NEW
+    def _get_base_asset_for_pair(self, pair: str) -> Optional[str]:
         """
         Look up the base asset for a given trading pair using AssetPairs.
         Uses a small cache to avoid repeated API calls for the same pair.
@@ -460,7 +460,7 @@ class KrakenBroker:
             dlog(f"[DEBUG] Kraken._get_base_asset_for_pair: error for pair={pair}: {e}")
         return None
 
-    def has_position(self, pair: str) -> bool:  # <<< NEW
+    def has_position(self, pair: str) -> bool:
         """
         Returns True if we currently hold any of the base asset for this pair.
         For example, for pair XBTUSD it checks whether our XXBT balance > 0.
@@ -537,6 +537,23 @@ class KrakenBroker:
             dlog(f"[DEBUG] Kraken.get_best_bid: invalid bid_str='{bid_str}'")
         return None
 
+    def _get_fallback_price(self, pair: str) -> Optional[float]:
+        """
+        Use last trade price from Ticker as a backup for sizing
+        when we can't get a clean best bid.
+        """
+        try:
+            ticker = self._public("Ticker", {"pair": pair})
+            k = next(iter(ticker.keys()))
+            last_str = ticker[k]["c"][0]  # 'c' = [last trade price, lot volume]
+            price = float(last_str)
+            dlog(f"[DEBUG] Kraken._get_fallback_price: pair={pair}, last_price={price}")
+            if price > 0:
+                return price
+        except Exception as e:
+            dlog(f"[DEBUG] Kraken._get_fallback_price: error for pair={pair}: {e}")
+        return None
+
     def place_order(self, symbol: str, notional: float) -> None:
         dlog(f"[DEBUG] Kraken.place_order: symbol={symbol}, notional={notional:.2f}")
         pair = self.symbol_to_pair(symbol)
@@ -551,38 +568,69 @@ class KrakenBroker:
             )
             return
 
+        # Try to use best bid first
         best_bid = self.get_best_bid(pair)
-        if best_bid is None:
-            dlog(
-                f"[DEBUG] Kraken.place_order: could not fetch best bid for {pair}, "
-                f"skipping order for {symbol}"
-            )
-            return
 
-        volume = notional / best_bid
-        volume = round(volume, 8)  # crypto precision
+        if best_bid is not None:
+            price_for_sizing = best_bid
+            ordertype = "limit"
+            extra_fields = {"price": str(best_bid)}
+            dlog(
+                f"[DEBUG] Kraken.place_order: using LIMIT, best_bid={best_bid} "
+                f"for sizing {symbol} ({pair})"
+            )
+        else:
+            # Fallback: use last trade price just for sizing, then send a MARKET order
+            dlog(
+                f"[DEBUG] Kraken.place_order: no clean best bid for {pair}, "
+                "falling back to MARKET order with last trade price for sizing."
+            )
+            fallback_price = self._get_fallback_price(pair)
+            if fallback_price is None:
+                dlog(
+                    f"[DEBUG] Kraken.place_order: no usable fallback price for {pair}, "
+                    f"skipping order for {symbol}"
+                )
+                return
+            price_for_sizing = fallback_price
+            ordertype = "market"
+            extra_fields = {}
+            dlog(
+                f"[DEBUG] Kraken.place_order: using MARKET fallback, "
+                f"fallback_price={fallback_price} for sizing {symbol} ({pair})"
+            )
+
+        # Size the order based on whichever price we ended up with
+        raw_volume = notional / price_for_sizing
+        volume = round(raw_volume, 8)  # crypto precision
+        est_notional = volume * price_for_sizing
+
         dlog(
-            f"[DEBUG] Kraken.place_order: best_bid={best_bid}, "
-            f"raw_volume={notional / best_bid}, rounded_volume={volume}"
+            f"[DEBUG] Kraken.place_order: price_for_sizing={price_for_sizing}, "
+            f"raw_volume={raw_volume}, rounded_volume={volume}, "
+            f"est_notional={est_notional:.2f}"
         )
 
-        if volume * best_bid < self.min_notional:
+        if est_notional < self.min_notional:
             dlog(
                 f"[DEBUG] Kraken.place_order: volume rounding makes order below min notional "
-                f"({volume * best_bid:.2f} < {self.min_notional:.2f}), skipping {symbol}"
+                f"({est_notional:.2f} < {self.min_notional:.2f}), skipping {symbol}"
             )
             return
 
         data = {
             "pair": pair,
             "type": "buy",
-            "ordertype": "limit",   # best-bid limit
-            "price": str(best_bid),
+            "ordertype": ordertype,
             "volume": str(volume),
-            # "timeinforce": "GTC",  # Kraken uses GTC/IOC/GTD. No pure "day" TIF.
+            **extra_fields,
         }
 
-        print(f"Kraken: placing LIMIT buy {symbol} ({pair}), vol={volume}, limit={best_bid}")
+        pretty_side = f"{ordertype.upper()} {symbol} ({pair})"
+        pretty_price = (
+            f"limit={price_for_sizing}" if ordertype == "limit" else "market"
+        )
+        print(f"Kraken: placing {pretty_side}, vol={volume}, {pretty_price}")
         self._private("AddOrder", data=data)
 
 
@@ -622,8 +670,8 @@ def process_signal(signal: TradeSignal, alpaca: AlpacaBroker, kraken: KrakenBrok
         if kraken.has_open_buy_order(pair):
             dlog(f"[DEBUG] Kraken: open BUY order already exists for {pair}, skipping.")
             return
-        # NEW: also skip if we already hold the base asset for this pair
-        if kraken.has_position(pair):  # <<< NEW
+        # also skip if we already hold the base asset for this pair
+        if kraken.has_position(pair):
             dlog(
                 f"[DEBUG] Kraken: position already exists for base asset of {pair}, "
                 f"skipping."
