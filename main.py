@@ -27,12 +27,12 @@ COL_IS_CRYPTO = 3   # Column D (TRUE => Kraken, FALSE => Alpaca)
 COL_SIGNAL = 18     # Column S
 COL_ICON = 22       # Column W
 
-BASE_ORDER_FRACTION = float(os.getenv("BASE_ORDER_FRACTION", "0.05"))
+BASE_ORDER_FRACTION = float(os.getenv("BASE_ORDER_FRACTION", "0.10"))
 MIN_SIGNAL_MULTIPLIER = float(os.getenv("MIN_SIGNAL_MULTIPLIER", "0.25"))
 MIN_ORDER_DOLLARS = float(os.getenv("MIN_ORDER_DOLLARS", "1.0"))
 
 ALPACA_MIN_ORDER_NOTIONAL = float(os.getenv("ALPACA_MIN_ORDER_NOTIONAL", "1.0"))
-KRAKEN_MIN_ORDER_NOTIONAL = float(os.getenv("KRAKEN_MIN_ORDER_NOTIONAL", "5.0"))
+KRAKEN_MIN_ORDER_NOTIONAL = float(os.getenv("KRAKEN_MIN_ORDER_NOTIONAL", "10.0"))
 
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_API_SECRET = os.getenv("ALPACA_API_SECRET")
@@ -297,6 +297,7 @@ class AlpacaBroker:
         return False
 
     def get_best_bid(self, symbol: str) -> Optional[float]:
+        # Still here if you ever want it, but no longer used for order placement.
         try:
             dlog(f"[DEBUG] Alpaca.get_best_bid: fetching latest quote for {symbol}")
             quote = self.api.get_latest_quote(symbol)
@@ -317,41 +318,15 @@ class AlpacaBroker:
             )
             return
 
-        best_bid = self.get_best_bid(symbol)
-
-        if best_bid is not None:
-            qty = round(notional / best_bid, 3)  # fractional shares
-            est_notional = qty * best_bid
-            dlog(
-                f"[DEBUG] Alpaca.place_order: best_bid={best_bid}, "
-                f"qty={qty}, est_notional={est_notional:.2f}"
-            )
-            if est_notional < self.min_notional:
-                dlog(
-                    f"[DEBUG] Alpaca.place_order: qty rounding makes order below min notional "
-                    f"({est_notional:.2f} < {self.min_notional:.2f}), skipping {symbol}"
-                )
-                return
-
-            print(f"Alpaca: placing LIMIT buy {symbol}, qty={qty}, limit={best_bid}")
-            self.api.submit_order(
-                symbol=symbol,
-                qty=str(qty),
-                side="buy",
-                type="limit",
-                time_in_force="day",
-                limit_price=str(best_bid),
-            )
-        else:
-            # Fallback: market notional order (no best-bid quote available)
-            print(f"Alpaca: no best bid, placing MARKET notional ${notional:.2f} for {symbol}")
-            self.api.submit_order(
-                symbol=symbol,
-                notional=str(notional),
-                side="buy",
-                type="market",
-                time_in_force="day",
-            )
+        # Pure MARKET notional order
+        print(f"Alpaca: placing MARKET notional ${notional:.2f} buy for {symbol}")
+        self.api.submit_order(
+            symbol=symbol,
+            notional=str(notional),
+            side="buy",
+            type="market",
+            time_in_force="day",
+        )
 
 
 # =========================
@@ -568,39 +543,36 @@ class KrakenBroker:
             )
             return
 
-        # Try to use best bid first
-        best_bid = self.get_best_bid(pair)
+        # We always do MARKET orders now, but still need a price to size volume.
+        price_for_sizing = None
 
-        if best_bid is not None:
+        best_bid = self.get_best_bid(pair)
+        if best_bid is not None and best_bid > 0:
             price_for_sizing = best_bid
-            ordertype = "limit"
-            extra_fields = {"price": str(best_bid)}
             dlog(
-                f"[DEBUG] Kraken.place_order: using LIMIT, best_bid={best_bid} "
+                f"[DEBUG] Kraken.place_order: using best_bid={best_bid} "
                 f"for sizing {symbol} ({pair})"
             )
         else:
-            # Fallback: use last trade price just for sizing, then send a MARKET order
             dlog(
                 f"[DEBUG] Kraken.place_order: no clean best bid for {pair}, "
-                "falling back to MARKET order with last trade price for sizing."
+                "trying fallback last trade price for sizing."
             )
             fallback_price = self._get_fallback_price(pair)
-            if fallback_price is None:
+            if fallback_price is not None and fallback_price > 0:
+                price_for_sizing = fallback_price
                 dlog(
-                    f"[DEBUG] Kraken.place_order: no usable fallback price for {pair}, "
-                    f"skipping order for {symbol}"
+                    f"[DEBUG] Kraken.place_order: using fallback_price={fallback_price} "
+                    f"for sizing {symbol} ({pair})"
                 )
-                return
-            price_for_sizing = fallback_price
-            ordertype = "market"
-            extra_fields = {}
-            dlog(
-                f"[DEBUG] Kraken.place_order: using MARKET fallback, "
-                f"fallback_price={fallback_price} for sizing {symbol} ({pair})"
-            )
 
-        # Size the order based on whichever price we ended up with
+        if price_for_sizing is None:
+            dlog(
+                f"[DEBUG] Kraken.place_order: no usable price for {pair}, "
+                f"skipping order for {symbol}"
+            )
+            return
+
         raw_volume = notional / price_for_sizing
         volume = round(raw_volume, 8)  # crypto precision
         est_notional = volume * price_for_sizing
@@ -621,16 +593,11 @@ class KrakenBroker:
         data = {
             "pair": pair,
             "type": "buy",
-            "ordertype": ordertype,
+            "ordertype": "market",
             "volume": str(volume),
-            **extra_fields,
         }
 
-        pretty_side = f"{ordertype.upper()} {symbol} ({pair})"
-        pretty_price = (
-            f"limit={price_for_sizing}" if ordertype == "limit" else "market"
-        )
-        print(f"Kraken: placing {pretty_side}, vol={volume}, {pretty_price}")
+        print(f"Kraken: placing MARKET buy {symbol} ({pair}), vol={volume}")
         self._private("AddOrder", data=data)
 
 
