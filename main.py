@@ -348,6 +348,9 @@ class KrakenBroker:
         # Cache for pair -> base asset lookups
         self._pair_base_cache: dict[str, str] = {}
 
+        # Cache for full pair info (includes ordemin, etc.)
+        self._pair_info_cache: dict[str, dict] = {}
+
     def _next_nonce(self) -> int:
         """
         Generate a strictly increasing nonce based on a *very* large
@@ -409,7 +412,30 @@ class KrakenBroker:
         dlog(f"[DEBUG] Kraken.symbol_to_pair: symbol={symbol} -> pair={pair}")
         return pair
 
-    # === base-asset and position helpers =======================
+    # === pair info & base-asset helpers =======================
+
+    def _get_pair_info(self, pair: str) -> Optional[dict]:
+        """
+        Fetch and cache the AssetPairs entry for a given pair.
+        This includes fields like 'base', 'ordermin', etc.
+        """
+        if pair in self._pair_info_cache:
+            return self._pair_info_cache[pair]
+
+        try:
+            info = self._public("AssetPairs", {"pair": pair})
+            if not info:
+                dlog(f"[DEBUG] Kraken._get_pair_info: empty info for pair={pair}")
+                return None
+
+            k = next(iter(info.keys()))
+            pair_info = info[k]
+            self._pair_info_cache[pair] = pair_info
+            vlog(f"[DEBUG] Kraken._get_pair_info: cached info for pair={pair}: {pair_info}")
+            return pair_info
+        except Exception as e:
+            dlog(f"[DEBUG] Kraken._get_pair_info: error fetching info for pair={pair}: {e}")
+            return None
 
     def _get_base_asset_for_pair(self, pair: str) -> Optional[str]:
         """
@@ -419,20 +445,17 @@ class KrakenBroker:
         if pair in self._pair_base_cache:
             return self._pair_base_cache[pair]
 
-        try:
-            info = self._public("AssetPairs", {"pair": pair})
-            if not info:
-                dlog(f"[DEBUG] Kraken._get_base_asset_for_pair: empty info for pair={pair}")
-                return None
+        pair_info = self._get_pair_info(pair)
+        if not pair_info:
+            dlog(f"[DEBUG] Kraken._get_base_asset_for_pair: no pair_info for pair={pair}")
+            return None
 
-            k = next(iter(info.keys()))
-            base_asset = info[k].get("base")
-            dlog(f"[DEBUG] Kraken._get_base_asset_for_pair: pair={pair}, base={base_asset}")
-            if base_asset:
-                self._pair_base_cache[pair] = base_asset
-                return base_asset
-        except Exception as e:
-            dlog(f"[DEBUG] Kraken._get_base_asset_for_pair: error for pair={pair}: {e}")
+        base_asset = pair_info.get("base")
+        dlog(f"[DEBUG] Kraken._get_base_asset_for_pair: pair={pair}, base={base_asset}")
+        if base_asset:
+            self._pair_base_cache[pair] = base_asset
+            return base_asset
+
         return None
 
     def has_position(self, pair: str) -> bool:
@@ -538,13 +561,13 @@ class KrakenBroker:
 
         if notional < self.min_notional:
             dlog(
-                f"[DEBUG] Kraken.place_order: notional ${notional:.2f} below Kraken min "
-                f"${self.min_notional:.2f}, skipping {symbol}"
+                f"[DEBUG] Kraken.place_order: initial notional ${notional:.2f} below Kraken "
+                f"config min ${self.min_notional:.2f}, skipping {symbol}"
             )
             return
 
         # We always do MARKET orders now, but still need a price to size volume.
-        price_for_sizing = None
+        price_for_sizing: Optional[float] = None
 
         best_bid = self.get_best_bid(pair)
         if best_bid is not None and best_bid > 0:
@@ -573,6 +596,7 @@ class KrakenBroker:
             )
             return
 
+        # Initial volume based on our sizing logic
         raw_volume = notional / price_for_sizing
         volume = round(raw_volume, 8)  # crypto precision
         est_notional = volume * price_for_sizing
@@ -583,10 +607,39 @@ class KrakenBroker:
             f"est_notional={est_notional:.2f}"
         )
 
+        # ===== NEW: bump up to Kraken's ordemin (per-pair volume minimum) =====
+        pair_info = self._get_pair_info(pair)
+        ordermin: Optional[float] = None
+        if pair_info is not None:
+            ord_str = pair_info.get("ordermin")
+            if ord_str is not None:
+                try:
+                    ordermin = float(ord_str)
+                except ValueError:
+                    dlog(
+                        f"[DEBUG] Kraken.place_order: invalid ordemin '{ord_str}' "
+                        f"for pair={pair}"
+                    )
+
+        if ordermin is not None and ordermin > 0 and volume < ordermin:
+            dlog(
+                f"[DEBUG] Kraken.place_order: volume {volume} below Kraken ordemin "
+                f"{ordemin} for {pair}, bumping volume up to ordemin."
+            )
+            volume = ordermin
+            est_notional = volume * price_for_sizing
+            dlog(
+                f"[DEBUG] Kraken.place_order: after ordemin bump: "
+                f"volume={volume}, est_notional={est_notional:.2f}"
+            )
+        # ===== END NEW BLOCK =====
+
+        # Re-check against our own notional floor using the final volume
         if est_notional < self.min_notional:
             dlog(
-                f"[DEBUG] Kraken.place_order: volume rounding makes order below min notional "
-                f"({est_notional:.2f} < {self.min_notional:.2f}), skipping {symbol}"
+                f"[DEBUG] Kraken.place_order: final est_notional ${est_notional:.2f} "
+                f"below Kraken config min ${self.min_notional:.2f} after ordemin bump, "
+                f"skipping {symbol}"
             )
             return
 
