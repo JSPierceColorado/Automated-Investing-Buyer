@@ -21,7 +21,7 @@ import alpaca_trade_api as tradeapi
 SPREADSHEET_NAME = "Active-Investing"
 WORKSHEET_NAME = "Automation-Screener"
 
-# Column indices (0-based) based on your description:
+# Column indices (0-based) based on your sheet:
 COL_SYMBOL = 2      # Column C
 COL_IS_CRYPTO = 3   # Column D (TRUE => Kraken, FALSE => Alpaca)
 COL_SIGNAL = 18     # Column S / pct_diff
@@ -664,8 +664,9 @@ def process_signal(
     kraken: Optional[KrakenBroker],
 ) -> None:
     """
-    Route a single TradeSignal to the appropriate broker. Supports running
-    with only one broker configured (e.g., Kraken-only or Alpaca-only).
+    Route a single TradeSignal to the appropriate broker.
+    - Stocks (Alpaca): skip if position already exists OR open BUY exists.
+    - Crypto (Kraken): skip only if open BUY exists; allow buys even if asset is held.
     """
 
     # Decide venue & ensure the right broker exists
@@ -712,13 +713,8 @@ def process_signal(
         if kraken.has_open_buy_order(pair):
             dlog(f"[DEBUG] Kraken: open BUY order already exists for {pair}, skipping.")
             return
-        # also skip if we already hold the base asset for this pair
-        if kraken.has_position(pair):
-            dlog(
-                f"[DEBUG] Kraken: position already exists for base asset of {pair}, "
-                f"skipping."
-            )
-            return
+        # NOTE: we intentionally do NOT check kraken.has_position() anymore,
+        # so crypto can scale in even if you already hold the asset.
     else:
         dlog("[DEBUG] process_signal: stock path, checking Alpaca open orders and positions...")
         if alpaca.has_open_buy_order(symbol_for_venue):
@@ -727,7 +723,7 @@ def process_signal(
                 f"{symbol_for_venue}, skipping."
             )
             return
-        # Also check positions so we don't double up the asset
+        # Also check positions so we don't double up the asset for stocks
         if alpaca.has_position(symbol_for_venue):
             dlog(
                 f"[DEBUG] Alpaca: position already exists for {symbol_for_venue}, "
