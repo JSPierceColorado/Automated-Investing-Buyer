@@ -24,18 +24,15 @@ WORKSHEET_NAME = "Automation-Screener"
 # Column indices (0-based) based on your description:
 COL_SYMBOL = 2      # Column C
 COL_IS_CRYPTO = 3   # Column D (TRUE => Kraken, FALSE => Alpaca)
-COL_SIGNAL = 18     # Column S
-COL_ICON = 23       # Column X
+COL_SIGNAL = 18     # Column S / pct_diff
+COL_ICON = 23       # Column X ("Buy symbol" / icon)
 
 BASE_ORDER_FRACTION = float(os.getenv("BASE_ORDER_FRACTION", "0.10"))
 MIN_SIGNAL_MULTIPLIER = float(os.getenv("MIN_SIGNAL_MULTIPLIER", "0.25"))
 MIN_ORDER_DOLLARS = float(os.getenv("MIN_ORDER_DOLLARS", "1.0"))
 
-ALPACA_MIN_ORDER_NOTIONAL = float(os.getenv("ALPACA_MIN_ORDER_NOTIONAL", "1.0"))
-KRAKEN_MIN_ORDER_NOTIONAL = float(os.getenv("KRAKEN_MIN_ORDER_NOTIONAL", "1.0"))
-
-ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
-ALPACA_API_SECRET = os.getenv("ALPACA_API_SECRET")
+ALPACA_API_KEY = os.getenv("ALPACA_API_KEY") or os.getenv("APCA_API_KEY_ID")
+ALPACA_API_SECRET = os.getenv("ALPACA_API_SECRET") or os.getenv("APCA_API_SECRET_KEY")
 ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 
 KRAKEN_API_KEY = os.getenv("KRAKEN_API_KEY")
@@ -135,6 +132,7 @@ def read_signals_from_sheet() -> List[TradeSignal]:
             f"is_crypto_col='{is_crypto_str}', signal='{signal_str}'"
         )
 
+        # Only process rows with the green icon
         if "🟢" not in icon:
             vlog(f"[DEBUG] Row {idx} skipped: no 🟢 icon.")
             continue
@@ -288,7 +286,6 @@ class AlpacaBroker:
             nested=False,
         )
         for o in orders:
-            # Avoid logging every order in production; use VERBOSE_DEBUG if needed
             vlog(f"[DEBUG] Alpaca.has_open_buy_order: open order {o.id} {o.symbol} {o.side}")
             if o.symbol.upper() == symbol.upper() and o.side.lower() == "buy":
                 dlog(f"[DEBUG] Alpaca.has_open_buy_order: open BUY order exists for {symbol}")
@@ -417,7 +414,7 @@ class KrakenBroker:
     def _get_pair_info(self, pair: str) -> Optional[dict]:
         """
         Fetch and cache the AssetPairs entry for a given pair.
-        This includes fields like 'base', 'ordermin', etc.
+        This includes fields like 'base', 'ordemin', etc.
         """
         if pair in self._pair_info_cache:
             return self._pair_info_cache[pair]
@@ -611,7 +608,7 @@ class KrakenBroker:
         pair_info = self._get_pair_info(pair)
         ordermin: Optional[float] = None
         if pair_info is not None:
-            ord_str = pair_info.get("ordermin")
+            ord_str = pair_info.get("ordemin")
             if ord_str is not None:
                 try:
                     ordermin = float(ord_str)
@@ -658,13 +655,35 @@ class KrakenBroker:
 # Main orchestration
 # =========================
 
-def process_signal(signal: TradeSignal, alpaca: AlpacaBroker, kraken: KrakenBroker) -> None:
-    venue = "Kraken" if signal.is_crypto else "Alpaca"
+def process_signal(
+    signal: TradeSignal,
+    alpaca: Optional[AlpacaBroker],
+    kraken: Optional[KrakenBroker],
+) -> None:
+    """
+    Route a single TradeSignal to the appropriate broker. Supports running
+    with only one broker configured (e.g., Kraken-only or Alpaca-only).
+    """
 
+    # Decide venue & ensure the right broker exists
     if signal.is_crypto:
+        if kraken is None:
+            dlog(
+                f"[DEBUG] process_signal: crypto signal for {signal.symbol}, "
+                "but Kraken is not configured. Skipping."
+            )
+            return
+        venue = "Kraken"
         broker = kraken
         symbol_for_venue = signal.symbol
     else:
+        if alpaca is None:
+            dlog(
+                f"[DEBUG] process_signal: stock signal for {signal.symbol}, "
+                "but Alpaca is not configured. Skipping."
+            )
+            return
+        venue = "Alpaca"
         broker = alpaca
         symbol_for_venue = signal.symbol
 
@@ -700,11 +719,17 @@ def process_signal(signal: TradeSignal, alpaca: AlpacaBroker, kraken: KrakenBrok
     else:
         dlog("[DEBUG] process_signal: stock path, checking Alpaca open orders and positions...")
         if alpaca.has_open_buy_order(symbol_for_venue):
-            dlog(f"[DEBUG] Alpaca: open BUY order already exists for {symbol_for_venue}, skipping.")
+            dlog(
+                f"[DEBUG] Alpaca: open BUY order already exists for "
+                f"{symbol_for_venue}, skipping."
+            )
             return
         # Also check positions so we don't double up the asset
         if alpaca.has_position(symbol_for_venue):
-            dlog(f"[DEBUG] Alpaca: position already exists for {symbol_for_venue}, skipping.")
+            dlog(
+                f"[DEBUG] Alpaca: position already exists for {symbol_for_venue}, "
+                f"skipping."
+            )
             return
 
     # Determine available funds on the selected venue
@@ -713,10 +738,16 @@ def process_signal(signal: TradeSignal, alpaca: AlpacaBroker, kraken: KrakenBrok
 
     notional = compute_order_notional(available_funds, signal.signal_pct)
     if notional <= 0:
-        dlog(f"[DEBUG] process_signal: computed notional is ${notional:.2f}, skipping (too small / zero).")
+        dlog(
+            f"[DEBUG] process_signal: computed notional is ${notional:.2f}, "
+            "skipping (too small / zero)."
+        )
         return
 
-    dlog(f"[DEBUG] process_signal: final notional for {symbol_for_venue}: ${notional:.2f}")
+    dlog(
+        f"[DEBUG] process_signal: final notional for {symbol_for_venue}: "
+        f"${notional:.2f}"
+    )
 
     # Final venue-specific min-check and order placement
     broker.place_order(symbol_for_venue, notional)
@@ -731,8 +762,29 @@ def main():
 
     dlog(f"[DEBUG] main: Found {len(signals)} signals with 🟢")
 
-    alpaca = AlpacaBroker()
-    kraken = KrakenBroker()
+    # Try to bring up Alpaca, but don't die if it fails.
+    alpaca: Optional[AlpacaBroker] = None
+    try:
+        alpaca = AlpacaBroker()
+    except Exception as e:
+        dlog(
+            f"[DEBUG] AlpacaBroker init failed ({e}). "
+            "Continuing without Alpaca (stocks disabled)."
+        )
+
+    # Try to bring up Kraken, but don't die if it fails.
+    kraken: Optional[KrakenBroker] = None
+    try:
+        kraken = KrakenBroker()
+    except Exception as e:
+        dlog(
+            f"[DEBUG] KrakenBroker init failed ({e}). "
+            "Continuing without Kraken (crypto disabled)."
+        )
+
+    if alpaca is None and kraken is None:
+        print("No brokers configured (both Alpaca and Kraken failed). Exiting.")
+        return
 
     for signal in signals:
         try:
