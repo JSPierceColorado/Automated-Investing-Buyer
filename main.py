@@ -25,7 +25,7 @@ WORKSHEET_NAME = "Automation-Screener"
 COL_SYMBOL = 2      # Column C
 COL_IS_CRYPTO = 3   # Column D (TRUE => Kraken, FALSE => Alpaca)
 COL_SIGNAL = 18     # Column S
-COL_ICON = 22       # Column W
+COL_ICON = 23       # Column X
 
 BASE_ORDER_FRACTION = float(os.getenv("BASE_ORDER_FRACTION", "0.10"))
 MIN_SIGNAL_MULTIPLIER = float(os.getenv("MIN_SIGNAL_MULTIPLIER", "0.25"))
