@@ -27,7 +27,7 @@ COL_IS_CRYPTO = 3   # Column D (TRUE => Kraken, FALSE => Alpaca)
 COL_SIGNAL = 18     # Column S / pct_diff
 COL_ICON = 23       # Column X ("Buy symbol" / icon)
 
-BASE_ORDER_FRACTION = float(os.getenv("BASE_ORDER_FRACTION", "0.10"))
+BASE_ORDER_FRACTION = float(os.getenv("BASE_ORDER_FRACTION", "0.25"))
 MIN_SIGNAL_MULTIPLIER = float(os.getenv("MIN_SIGNAL_MULTIPLIER", "0.25"))
 MIN_ORDER_DOLLARS = float(os.getenv("MIN_ORDER_DOLLARS", "1.0"))
 
